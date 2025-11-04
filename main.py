@@ -406,6 +406,13 @@ async def apply_player_actions(room_id: str):
 
     room["actions"] = []
     await broadcast(room_id, {"type": "room", "room": summary(room)})
+    
+    async def reveal_death(room_id: str, player):
+    """Reveals a player's death with role and faction info."""
+    if not player["revealed"]:
+        player["revealed"] = True
+        msg = f"💀 {player['name']} was the {player['role']} ({player['faction']})!"
+        await broadcast(room_id, {"type": "system", "text": msg})
 
 
 async def check_victory(room_id: str):
