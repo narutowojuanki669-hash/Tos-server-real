@@ -395,11 +395,10 @@ async def apply_player_actions(room_id: str):
 
     # Apply results
     for k in set(killed):
-        victim = next((p for p in room["players"] if p["name"] == k), None)
-        if victim and victim["alive"]:
-            victim["alive"] = False
-            victim["revealed"] = True
-            await broadcast(room_id, {"type": "system", "text": f"💀 {k} was found dead!"})
+    victim = next((p for p in room["players"] if p["name"] == k), None)
+    if victim and victim["alive"]:
+        victim["alive"] = False
+        await reveal_death(room_id, victim)
 
     for c in converted:
         await broadcast(room_id, {"type": "system", "text": f"✨ {c} has joined the Cult!"})
