@@ -159,17 +159,18 @@ async def ws_room(ws:WebSocket,rid:str):
 # --- Game Flow Extensions ---
 
 @app.post("/start-game/{rid}")
-def start_game(rid: str):
+async def start_game(rid: str):
     room = rooms.get(rid)
     if not room:
         raise HTTPException(404, "Room not found")
     if room["state"] == "active":
-        return {"ok": True, "message": "Game already running"}  # smoother response
+        return {"ok": True, "message": "Game already running"}
     room["state"] = "active"
     room["phase"] = "day"
     room["day"] = 1
-    asyncio.create_task(broadcast(rid, {"type": "system", "text": "🌞 The game has started!"}))
-    asyncio.create_task(broadcast(rid, {"type": "room", "room": summary(room)}))
+    await broadcast(rid, {"type": "system", "text": "🌞 The game has started!"})
+    await broadcast(rid, {"type": "room", "room": summary(room)})
+    asyncio.create_task(perform_bot_day_actions(rid))
     return {"ok": True, "message": "Game started"}
 
 @app.post("/next-phase/{rid}")
