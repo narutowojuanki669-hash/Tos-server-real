@@ -331,6 +331,66 @@ async def perform_bot_night_actions(room_id: str):
     await asyncio.sleep(3)
     await check_victory(room_id)
 
+async def apply_player_actions(room_id: str):
+    """Processes queued night actions (from humans or bots)."""
+    room = rooms.get(room_id)
+    if not room:
+        return
+
+    actions = room.get("actions", [])
+    protected = set()
+    killed = []
+    converted = []
+
+    for action in actions:
+        actor = next((p for p in room["players"] if p["name"] == action["actor"]), None)
+        target = next((p for p in room["players"] if p["name"] == action["target"]), None)
+        if not actor or not target or not actor["alive"]:
+            continue
+
+        role = actor.get("role")
+        # --- Town Roles ---
+        if role == "Doctor":
+            protected.add(target["name"])
+        elif role == "Detective":
+            info = "Mafia" if target["faction"] == "Mafia" else "Not Mafia"
+            await broadcast(room_id, {"type": "private", "to": actor["name"], "text": f"🕵️ Your target {target['name']} is {info}."})
+        elif role == "Bodyguard":
+            if target["name"] in killed:
+                killed.remove(target["name"])
+                actor["alive"] = False
+                actor["revealed"] = True
+                await broadcast(room_id, {"type": "system", "text": f"🛡️ {actor['name']} died protecting {target['name']}!"})
+
+        # --- Mafia Roles ---
+        elif role == "Mafioso" and target["name"] not in protected:
+            killed.append(target["name"])
+        elif role == "Beastman" and target["name"] not in protected:
+            killed.append(target["name"])
+
+        # --- Cult Roles ---
+        elif role == "Cult Leader" and target["faction"] not in ["Mafia", "Cult"]:
+            target["faction"] = "Cult"
+            converted.append(target["name"])
+
+        # --- Neutral Roles (example Serial Killer) ---
+        elif role == "Serial Killer" and target["name"] not in protected:
+            killed.append(target["name"])
+
+    # Apply results
+    for k in set(killed):
+        victim = next((p for p in room["players"] if p["name"] == k), None)
+        if victim and victim["alive"]:
+            victim["alive"] = False
+            victim["revealed"] = True
+            await broadcast(room_id, {"type": "system", "text": f"💀 {k} was found dead!"})
+
+    for c in converted:
+        await broadcast(room_id, {"type": "system", "text": f"✨ {c} has joined the Cult!"})
+
+    room["actions"] = []
+    await broadcast(room_id, {"type": "room", "room": summary(room)})
+
 
 async def check_victory(room_id: str):
     """Checks win conditions and moves to next day."""
