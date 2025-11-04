@@ -3,26 +3,20 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# CORS setup for your Netlify frontend
+# ✅ allow your specific Netlify frontend
+origins = [
+    "https://690a4beb4e174c424fe59d8c--townofshadows.netlify.app",
+    "http://localhost:3000",  # optional for testing
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://bright-sunshine-4f6996.netlify.app",
-        "http://localhost:3000"
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"message": "Welcome to Town of Shadows backend!"}
-
 @app.get("/test")
-def test_route():
-    return {"message": "Server is running correctly!"}
-
-@app.get("/players")
-def get_players():
-    return {"players": []}
+def read_root():
+    return "Hello from Town of Shadows backend!"
