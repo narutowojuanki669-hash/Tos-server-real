@@ -300,6 +300,21 @@ async def resolve_votes(room_id: str):
     await asyncio.sleep(3)
     await perform_bot_night_actions(room_id)
 
+@app.post("/queue-action")
+async def queue_action(room_id: str, actor: str, target: str):
+    """Queue an action for later resolution."""
+    room = rooms.get(room_id)
+    if not room:
+        raise HTTPException(404, "Room not found")
+    if room["phase"] != "night":
+        raise HTTPException(400, "Actions only at night")
+
+    if "actions" not in room:
+        room["actions"] = []
+
+    room["actions"].append({"actor": actor, "target": target})
+    await broadcast(room_id, {"type": "system", "text": f"{actor} has selected a target..."})
+    return {"ok": True}
 
 async def perform_bot_night_actions(room_id: str):
     """Bots automatically perform night actions."""
