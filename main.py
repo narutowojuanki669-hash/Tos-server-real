@@ -8,7 +8,7 @@ import asyncio, json, random, traceback
 app = FastAPI(title="Town of Shadows – Final Server")
 
 # ✅ Updated frontend domain
-FRONTEND_ORIGIN = "https://690a64824cd1d9834c081fcd--resonant-cobbler-2fa697.netlify.app"
+FRONTEND_ORIGIN = "https://690a8382d00a2311478c4251--celebrated-bonbon-1fd3cf.netlify.app"
 
 TOTAL_PLAYERS = 20
 FACTION_COUNTS = {"town": 8, "mafia": 5, "cult": 4, "neutrals": 3}
