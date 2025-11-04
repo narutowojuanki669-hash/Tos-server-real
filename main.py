@@ -343,6 +343,7 @@ async def perform_bot_night_actions(room_id: str):
 
     await broadcast(room_id, {"type": "room", "room": summary(room)})
 
+    await apply_player_actions(room_id)
     await asyncio.sleep(3)
     await check_victory(room_id)
 
