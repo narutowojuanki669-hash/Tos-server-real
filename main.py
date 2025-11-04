@@ -5,39 +5,37 @@
 # This server implements rooms, AI fillers, private role messages, and simple night processing.
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-@app.get("/test")
-def test():
-    return {"message": "Server is running!"}
-
-@app.get("/")
-def home():
-    return {"message": "Welcome to Town of Shadows server!"}
-
-import asyncio, json, random, os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, List, Any
-from uuid import uuid4
-
-app = FastAPI(title="Town of Shadows - FastAPI Server (Enhanced)")
-
-# Allow Netlify frontend origin and common local hosts
-origins = [
-    "https://69095967f1d5a6e43a33739b--bright-sunshine-4f6996.netlify.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "https://localhost"
-]
+# ✅ Allow your Netlify frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins + ["*"],
+    allow_origins=[
+        "https://bright-sunshine-4f6996.netlify.app",  # your Netlify site
+        "http://localhost:3000"  # for local testing
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ✅ Root route
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to Town of Shadows backend!"}
+
+# ✅ Test route to verify connection
+@app.get("/test")
+def test_route():
+    return {"message": "Server is running correctly!"}
+
+# ✅ Example placeholder for game logic (future use)
+@app.get("/players")
+def get_players():
+    # Later, this will return a list of players in the game
+    return {"players": []}
 
 # --- Configuration ---
 TOTAL_PLAYERS = 20
