@@ -156,3 +156,35 @@ async def ws_room(ws:WebSocket,rid:str):
         traceback.print_exc()
         try: await ws.send_text(json.dumps({"type":"system","text":f"Server error {e}"}))
         except: pass
+# --- Game Flow Extensions ---
+
+@app.post("/start-game/{rid}")
+def start_game(rid: str):
+    room = rooms.get(rid)
+    if not room:
+        raise HTTPException(404, "Room not found")
+    if room["state"] != "waiting":
+        raise HTTPException(400, "Game already started")
+    room["state"] = "active"
+    room["phase"] = "day"
+    room["day"] = 1
+    asyncio.create_task(broadcast(rid, {"type": "system", "text": "🌞 The game has started!"}))
+    asyncio.create_task(broadcast(rid, {"type": "room", "room": summary(room)}))
+    return {"ok": True, "message": "Game started"}
+
+@app.post("/next-phase/{rid}")
+def next_phase(rid: str):
+    room = rooms.get(rid)
+    if not room:
+        raise HTTPException(404, "Room not found")
+    if room["state"] != "active":
+        raise HTTPException(400, "Game not active")
+    room["phase"] = "night" if room["phase"] == "day" else "day"
+    if room["phase"] == "day":
+        room["day"] += 1
+    asyncio.create_task(broadcast(rid, {
+        "type": "system",
+        "text": f"🔄 Phase changed to {room['phase']} (Day {room['day']})"
+    }))
+    asyncio.create_task(broadcast(rid, {"type": "room", "room": summary(room)}))
+    return {"ok": True, "phase": room["phase"], "day": room["day"]}
