@@ -6,7 +6,7 @@ app = FastAPI()  # ✅ define the app first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://690a4beb4e174c424fe59d8c--townofshadows.netlify.app",
+        "https://690a605759df9864bca76c4c--resonant-cobbler-2fa697.netlify.app",
         "http://localhost:3000"
     ],
     allow_credentials=True,
