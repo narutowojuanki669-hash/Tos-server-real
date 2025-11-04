@@ -446,3 +446,29 @@ async def check_victory(room_id: str):
     await broadcast(room_id, {"type": "system", "text": f"🌞 Day {room['day']} begins!"})
     await broadcast(room_id, {"type": "room", "room": summary(room)})
     await perform_bot_day_actions(room_id)
+
+async def end_game(room_id: str, winner_faction: str):
+    """Handles end-game summary and victory display."""
+    room = rooms.get(room_id)
+    if not room:
+        return
+
+    room["state"] = "ended"
+    room["winner"] = winner_faction
+
+    if winner_faction == "Town":
+        msg = "🌼 The Town has purged the darkness and won the game!"
+    elif winner_faction == "Mafia":
+        msg = "💀 The Mafia controls the shadows — they win!"
+    elif winner_faction == "Cult":
+        msg = "🔮 The Cult's whispers have consumed all minds!"
+    else:
+        msg = "⚖️ The Neutrals outlived all others!"
+
+    await broadcast(room_id, {"type": "system", "text": msg})
+    await asyncio.sleep(2)
+
+    # Reveal everyone’s roles
+    recap = "\n".join([f"{p['name']}: {p['role']} ({p['faction']}) {'✅' if p['alive'] else '💀'}" for p in room["players"]])
+    await broadcast(room_id, {"type": "system", "text": "📜 Final Roles:\n" + recap})
+    await broadcast(room_id, {"type": "room", "room": summary(room)})
