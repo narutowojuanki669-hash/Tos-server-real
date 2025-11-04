@@ -163,8 +163,8 @@ def start_game(rid: str):
     room = rooms.get(rid)
     if not room:
         raise HTTPException(404, "Room not found")
-    if room["state"] != "waiting":
-        raise HTTPException(400, "Game already started")
+    if room["state"] == "active":
+        return {"ok": True, "message": "Game already running"}  # smoother response
     room["state"] = "active"
     room["phase"] = "day"
     room["day"] = 1
