@@ -188,3 +188,64 @@ def next_phase(rid: str):
     }))
     asyncio.create_task(broadcast(rid, {"type": "room", "room": summary(room)}))
     return {"ok": True, "phase": room["phase"], "day": room["day"]}
+# --- Voting and Night Actions ---
+
+@app.post("/vote")
+async def vote(room_id: str, voter: str, target: str):
+    """Registers a daytime vote."""
+    room = rooms.get(room_id)
+    if not room:
+        raise HTTPException(404, "Room not found")
+    if room["phase"] != "day":
+        raise HTTPException(400, "Voting only during the day")
+
+    room["votes"][voter] = target
+    await broadcast(room_id, {"type": "system", "text": f"{voter} voted for {target}"})
+
+    # Check if all living players have voted
+    alive = [p for p in room["players"] if p["alive"]]
+    if len(room["votes"]) >= len(alive):
+        # Count votes
+        tally = {}
+        for t in room["votes"].values():
+            tally[t] = tally.get(t, 0) + 1
+        top = max(tally, key=tally.get)
+        # Eliminate top voted player
+        target_player = next((p for p in alive if p["name"] == top), None)
+        if target_player:
+            target_player["alive"] = False
+            target_player["revealed"] = True
+            await broadcast(room_id, {"type": "system", "text": f"⚖️ {top} was voted out!"})
+            await broadcast(room_id, {"type": "room", "room": summary(room)})
+
+        room["votes"] = {}
+        room["phase"] = "night"
+        await broadcast(room_id, {"type": "system", "text": "🌙 Night begins..."})
+
+    return {"ok": True, "votes": room["votes"]}
+
+
+@app.post("/night-action")
+async def night_action(room_id: str, actor: str, target: str):
+    """Handles simple night actions like mafia kills or doctor saves."""
+    room = rooms.get(room_id)
+    if not room:
+        raise HTTPException(404, "Room not found")
+    if room["phase"] != "night":
+        raise HTTPException(400, "Night actions only allowed at night")
+
+    actor_player = next((p for p in room["players"] if p["name"] == actor), None)
+    target_player = next((p for p in room["players"] if p["name"] == target), None)
+    if not actor_player or not target_player:
+        raise HTTPException(400, "Invalid actor or target")
+
+    # Basic rule example:
+    if actor_player["faction"] == "Mafia" and actor_player["alive"]:
+        target_player["alive"] = False
+        target_player["revealed"] = True
+        await broadcast(room_id, {"type": "system", "text": f"💀 {target} was killed overnight!"})
+        await broadcast(room_id, {"type": "room", "room": summary(room)})
+
+    # For now, other roles just log their action
+    await broadcast(room_id, {"type": "system", "text": f"{actor} performed an action on {target}"})
+    return {"ok": True}
