@@ -5,26 +5,17 @@
 # This server implements rooms, AI fillers, private role messages, and simple night processing.
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-# create FastAPI app
-app = FastAPI(title="Town of Shadows - Server")
+app = FastAPI()
 
-# allow frontend to connect
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # you can replace "*" with your Netlify URL later for security
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# test route
 @app.get("/test")
 def test():
-    return {"message": "Server is running"}
+    return {"message": "Server is running!"}
 
-# ---- keep your other routes below this line ----
+@app.get("/")
+def home():
+    return {"message": "Welcome to Town of Shadows server!"}
+
 import asyncio, json, random, os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
