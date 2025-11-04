@@ -415,7 +415,7 @@ async def apply_player_actions(room_id: str):
 
 
 async def check_victory(room_id: str):
-    """Checks win conditions and moves to next day."""
+    """Checks for win conditions and declares results."""
     room = rooms.get(room_id)
     if not room:
         return
@@ -424,21 +424,23 @@ async def check_victory(room_id: str):
     mafia_alive = [p for p in alive if p["faction"] == "Mafia"]
     cult_alive = [p for p in alive if p["faction"] == "Cult"]
     town_alive = [p for p in alive if p["faction"] == "Town"]
+    neutral_alive = [p for p in alive if p["faction"] == "Neutral"]
 
+    # Win checks
     if not mafia_alive and not cult_alive:
-        await broadcast(room_id, {"type": "system", "text": "🌼 Town has won the game!"})
-        room["state"] = "ended"
+        await end_game(room_id, "Town")
         return
-    if not town_alive and len(mafia_alive) > len(cult_alive):
-        await broadcast(room_id, {"type": "system", "text": "💀 Mafia has taken over!"})
-        room["state"] = "ended"
+    if not town_alive and len(mafia_alive) >= len(cult_alive):
+        await end_game(room_id, "Mafia")
         return
     if len(cult_alive) >= len(mafia_alive) + len(town_alive):
-        await broadcast(room_id, {"type": "system", "text": "🔮 The Cult dominates all!"})
-        room["state"] = "ended"
+        await end_game(room_id, "Cult")
+        return
+    if not any([mafia_alive, cult_alive, town_alive]) and neutral_alive:
+        await end_game(room_id, "Neutral")
         return
 
-    # No winner yet → continue next day
+    # No winner yet → continue game
     room["phase"] = "day"
     room["day"] += 1
     await broadcast(room_id, {"type": "system", "text": f"🌞 Day {room['day']} begins!"})
