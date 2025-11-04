@@ -249,3 +249,115 @@ async def night_action(room_id: str, actor: str, target: str):
     # For now, other roles just log their action
     await broadcast(room_id, {"type": "system", "text": f"{actor} performed an action on {target}"})
     return {"ok": True}
+    import random
+
+async def perform_bot_day_actions(room_id: str):
+    """Bots automatically vote during the day."""
+    room = rooms.get(room_id)
+    if not room or room["phase"] != "day":
+        return
+
+    alive_players = [p for p in room["players"] if p["alive"]]
+    for bot in [p for p in alive_players if p["is_bot"]]:
+        targets = [p["name"] for p in alive_players if p["name"] != bot["name"]]
+        if not targets:
+            continue
+        target = random.choice(targets)
+        room["votes"][bot["name"]] = target
+        await broadcast(room_id, {"type": "system", "text": f"🤖 {bot['name']} voted for {target}"})
+
+    # Check if all living players have voted
+    alive = [p for p in room["players"] if p["alive"]]
+    if len(room["votes"]) >= len(alive):
+        await resolve_votes(room_id)
+
+
+async def resolve_votes(room_id: str):
+    """Resolves daytime votes."""
+    room = rooms.get(room_id)
+    if not room:
+        return
+
+    tally = {}
+    for t in room["votes"].values():
+        tally[t] = tally.get(t, 0) + 1
+
+    if not tally:
+        return
+
+    top = max(tally, key=tally.get)
+    target_player = next((p for p in room["players"] if p["name"] == top and p["alive"]), None)
+    if target_player:
+        target_player["alive"] = False
+        target_player["revealed"] = True
+        await broadcast(room_id, {"type": "system", "text": f"⚖️ {top} was voted out!"})
+        await broadcast(room_id, {"type": "room", "room": summary(room)})
+
+    room["votes"].clear()
+    room["phase"] = "night"
+    await broadcast(room_id, {"type": "system", "text": "🌙 Night begins..."})
+    await asyncio.sleep(3)
+    await perform_bot_night_actions(room_id)
+
+
+async def perform_bot_night_actions(room_id: str):
+    """Bots automatically perform night actions."""
+    room = rooms.get(room_id)
+    if not room or room["phase"] != "night":
+        return
+
+    alive_players = [p for p in room["players"] if p["alive"]]
+    mafia = [p for p in alive_players if p["faction"] == "Mafia"]
+    cult = [p for p in alive_players if p["faction"] == "Cult"]
+
+    # Mafia kill
+    if mafia:
+        victim = random.choice([p for p in alive_players if p["faction"] != "Mafia"])
+        victim["alive"] = False
+        victim["revealed"] = True
+        await broadcast(room_id, {"type": "system", "text": f"💀 {victim['name']} was killed overnight!"})
+
+    # Cult recruit
+    if cult:
+        candidates = [p for p in alive_players if p["faction"] not in ["Cult", "Mafia"]]
+        if candidates:
+            recruit = random.choice(candidates)
+            recruit["faction"] = "Cult"
+            await broadcast(room_id, {"type": "system", "text": f"✨ {recruit['name']} has been converted to the Cult!"})
+
+    await broadcast(room_id, {"type": "room", "room": summary(room)})
+
+    await asyncio.sleep(3)
+    await check_victory(room_id)
+
+
+async def check_victory(room_id: str):
+    """Checks win conditions and moves to next day."""
+    room = rooms.get(room_id)
+    if not room:
+        return
+
+    alive = [p for p in room["players"] if p["alive"]]
+    mafia_alive = [p for p in alive if p["faction"] == "Mafia"]
+    cult_alive = [p for p in alive if p["faction"] == "Cult"]
+    town_alive = [p for p in alive if p["faction"] == "Town"]
+
+    if not mafia_alive and not cult_alive:
+        await broadcast(room_id, {"type": "system", "text": "🌼 Town has won the game!"})
+        room["state"] = "ended"
+        return
+    if not town_alive and len(mafia_alive) > len(cult_alive):
+        await broadcast(room_id, {"type": "system", "text": "💀 Mafia has taken over!"})
+        room["state"] = "ended"
+        return
+    if len(cult_alive) >= len(mafia_alive) + len(town_alive):
+        await broadcast(room_id, {"type": "system", "text": "🔮 The Cult dominates all!"})
+        room["state"] = "ended"
+        return
+
+    # No winner yet → continue next day
+    room["phase"] = "day"
+    room["day"] += 1
+    await broadcast(room_id, {"type": "system", "text": f"🌞 Day {room['day']} begins!"})
+    await broadcast(room_id, {"type": "room", "room": summary(room)})
+    await perform_bot_day_actions(room_id)
