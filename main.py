@@ -1,15 +1,7 @@
 # main.py
-# Town of Shadows - All-in-one backend (FastAPI + WebSocket)
-# - Integrated roles and skills (Doctor, Beastman, Cupid, Janitor, Jester, Executioner, etc.)
-# - Timers & phase segmentation: Day (60s discussion, 20s voting, 10s defence, 10s final), Night (40s)
-# - Doctor protection: prevents death for healed target except Beastman kills bypass it
-# - On game start all connected humans receive their private role immediately
-#
-# Deploy with:
-#   requirements.txt: fastapi, uvicorn[standard]
-#   start command: uvicorn main:app --host 0.0.0.0 --port 10000
-
-import asyncio, json, random, traceback, time
+# Town of Shadows - Completed integrated backend
+# Deploy: uvicorn main:app --host 0.0.0.0 --port 10000
+import asyncio, json, random, time, traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,7 +12,9 @@ app = FastAPI(title="Town of Shadows - Complete Server")
 
 # === CONFIG ===
 FRONTEND_ORIGIN = "https://690a8382d00a2311478c4251--celebrated-bonbon-1fd3cf.netlify.app"
+BACKEND_WS_BASE = "wss://town-of-shadows-server.onrender.com/ws"  # for clarity; clients use full URL
 TOTAL_PLAYERS = 20
+
 # Phase durations (seconds)
 DAY_DISCUSS = 60
 DAY_VOTE = 20
@@ -37,6 +31,7 @@ ROLE_POOL = {
     "neutrals": ["Jester","Executioner","Serial Killer","Arsonist","Survivor","Amnesiac","Witch","Guardian Angel"]
 }
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN, "http://localhost:3000", "http://localhost:5173", "*"],
@@ -45,7 +40,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === util helpers ===
+# === helpers ===
 def sample(a): return random.choice(a)
 def shuffle(a): b=a[:]; random.shuffle(b); return b
 
@@ -55,14 +50,16 @@ def build_mafia_roles():
     roles.append(sample(others))
     while len(roles) < FACTION_COUNTS["mafia"]:
         roles.append("Mafioso" if random.random()<0.5 else sample(others))
-    random.shuffle(roles); return roles
+    random.shuffle(roles)
+    return roles
 
 def build_cult_roles():
     roles=["Cult Leader","Fanatic"]
     pool=[r for r in ROLE_POOL["cult"] if r not in roles]
     while len(roles) < FACTION_COUNTS["cult"]:
         roles.append(sample(pool))
-    random.shuffle(roles); return roles
+    random.shuffle(roles)
+    return roles
 
 def build_town_roles(): return shuffle(ROLE_POOL["town"])[:FACTION_COUNTS["town"]]
 def build_neutrals(): return shuffle(ROLE_POOL["neutrals"])[:FACTION_COUNTS["neutrals"]]
@@ -72,7 +69,8 @@ def build_full_roles():
     all_roles = town + mafia + cult + neutrals
     while len(all_roles) < TOTAL_PLAYERS:
         all_roles.append(sample(ROLE_POOL["town"]))
-    random.shuffle(all_roles); return all_roles
+    random.shuffle(all_roles)
+    return all_roles
 
 def role_to_faction(role):
     if role in ROLE_POOL["town"]: return "Town"
@@ -83,18 +81,18 @@ def role_to_faction(role):
 
 # === in-memory state ===
 rooms: Dict[str, Any] = {}
-room_ws: Dict[str, Any] = {}   # room_id -> RoomWebsockets
+room_ws: Dict[str, Any] = {}
 
 class RoomWebsockets:
     def __init__(self):
         self.sockets: Dict[str, WebSocket] = {}
     async def send(self, message: dict):
         dead=[]
-        for ws_id, ws in list(self.sockets.items()):
+        for wsid, ws in list(self.sockets.items()):
             try:
                 await ws.send_text(json.dumps(message))
             except Exception:
-                dead.append(ws_id)
+                dead.append(wsid)
         for d in dead:
             self.sockets.pop(d, None)
 
@@ -103,7 +101,7 @@ async def broadcast(room_id: str, message: dict):
     if mgr:
         await mgr.send(message)
 
-# === create room ===
+# === room creation ===
 def create_room_object(host_name="Host"):
     room_id = str(uuid4())[:6].upper()
     roles = build_full_roles()
@@ -120,23 +118,24 @@ def create_room_object(host_name="Host"):
             "revealed": False,
             "doused": False,
             "ws_id": None,
-            # role flags
-            "doctor_self_heals_left": 9999 if r=="Doctor" else 0,  # unlimited as you specified
+            # mechanics flags
             "cupid_used": False,
-            "executioner_target": None,
             "janitor_used": False,
+            "vigilante_last_shot_day": -99, # day index of last shot for cooldown
+            "vigilante_shots_left": 1,      # not used, keeps flexible
+            "jailor_has_execute": True if r=="Jailor" else False,
+            "guardian_protects": None,
         }
         players.append(p)
     room = {
         "id": room_id, "host": host_name, "players": players,
-        "state": "waiting", "phase": "day", "day": 1,
-        "actions": [], "votes": {}, "sockets": {},
-        "lovers": {}, "winners": [], "execution_targets": {},
-        # per-phase countdown control
-        "phase_controller": None,
-        "phase_deadline": None
+        "state":"waiting", "phase":"day", "day":1,
+        "actions":[], "votes":{}, "sockets":{},
+        "lovers":{}, "winners":[], "execution_targets":{},
+        # phase controller
+        "controller_task": None,
     }
-    # pre-assign executioner targets (if any)
+    # pre-assign executioner targets
     for p in room["players"]:
         if p["role"] == "Executioner":
             possible = [x["name"] for x in room["players"] if x["name"] != p["name"]]
@@ -150,16 +149,23 @@ def room_summary(room):
     return {
         "id": room["id"], "host": room["host"], "state": room["state"],
         "phase": room["phase"], "day": room["day"],
-        "players": [{ "slot":p["slot"], "name":p["name"], "alive":p["alive"], "revealed":p["revealed"], "symbol": p["role"] if p["revealed"] else ("?" if p["alive"] else None), "is_bot":p["is_bot"] } for p in room["players"]]
+        "players":[
+            {"slot":p["slot"], "name":p["name"], "alive":p["alive"], "revealed":p["revealed"],
+             "symbol": p["role"] if p["revealed"] else ("?" if p["alive"] else None),
+             "is_bot": p["is_bot"]}
+            for p in room["players"]
+        ]
     }
 
 def role_explain(role, faction):
     explanations = {
         "Doctor":"Town. Heals a player each night; protection prevents kills except Beastman bypass.",
-        "Detective":"Town. Investigates whether target is Mafia.",
-        "Beastman":"Mafia-affiliated; kills bypass Doctor protection after contact.",
-        "Jester":"Neutral. Wins if lynched; game continues.",
-        "Executioner":"Neutral. Picks a target; wins if target is lynched; game continues."
+        "Detective":"Town. Investigates alignment.",
+        "Beastman":"Mafia. Kill bypasses Doctor protection after contact.",
+        "Vigilante":"Town. Can shoot every 2 nights. Kills only succeed vs Mafia members.",
+        "Jailor":"Town. Jail one player each night; can execute once.",
+        "Medium":"Town. Can talk with the dead at night.",
+        "Cupid":"Neutral/Town. Link two players as lovers."
     }
     return explanations.get(role, f"{role} — {faction} role.")
 
@@ -183,8 +189,8 @@ def join_room(req: JoinRequest):
     if not room: raise HTTPException(status_code=404, detail="Room not found")
     slot = next((p for p in room["players"] if p["is_bot"]), None)
     if not slot: raise HTTPException(status_code=400, detail="Room full")
-    slot["is_bot"] = False; slot["name"] = req.name or slot["name"]
-    # return private role and current room summary
+    slot["is_bot"] = False
+    slot["name"] = req.name or slot["name"]
     return {"slot": slot["slot"], "role": slot["role"], "faction": slot["faction"], "explain": role_explain(slot["role"], slot["faction"]), "room": room_summary(room)}
 
 @app.get("/room/{room_id}")
@@ -207,15 +213,15 @@ def player_action(req: ActionRequest):
     room.setdefault("actions", []).append(act)
     return {"status":"queued","action":act}
 
-# === Start game: send private roles to every connected human immediately ===
+# === START GAME (send private roles immediately and start controller) ===
 @app.post("/start-game/{rid}")
 async def start_game(rid: str):
     room = rooms.get(rid)
     if not room: raise HTTPException(status_code=404, detail="Room not found")
     if room["state"] == "active":
-        return {"ok": True, "message": "Game already running"}
-    room["state"] = "active"; room["phase"] = "day"; room["day"] = 1
-    # send private roles to all connected humans (ws_id present)
+        return {"ok": True, "message":"Game already running"}
+    room["state"] = "active"; room["phase"] = "day"; room["day"] = 1; room["actions"]=[]
+    # send private roles to connected humans
     for p in room["players"]:
         if not p["is_bot"] and p.get("ws_id"):
             ws = room_ws[rid].sockets.get(p["ws_id"])
@@ -226,8 +232,8 @@ async def start_game(rid: str):
                     pass
     await broadcast(rid, {"type":"system","text":"Game started. Day 1 begins."})
     await broadcast(rid, {"type":"room","room": room_summary(room)})
-    # begin the phase controller loop for this room
-    asyncio.create_task(phase_controller_loop(rid))
+    # launch controller
+    room["controller_task"] = asyncio.create_task(phase_controller_loop(rid))
     return {"status":"started","room": room_summary(room)}
 
 @app.post("/next-phase/{rid}")
@@ -235,79 +241,137 @@ async def next_phase(rid: str):
     room = rooms.get(rid)
     if not room: raise HTTPException(status_code=404, detail="Room not found")
     if room["state"] != "active": raise HTTPException(status_code=400, detail="Game not active")
-    # toggle to next logical phase: if day -> move to night immediately
-    room["phase"] = "night" if room["phase"] == "day" else "day"
-    if room["phase"] == "day": room["day"] += 1
-    await broadcast(rid, {"type":"system","text":f"Phase changed to {room['phase']} (Day {room['day']})"})
+    # move immediately to night or day; used mainly for testing
+    if room["phase"] == "day":
+        # end day, start night
+        room["phase"] = "night"
+    else:
+        room["phase"] = "day"; room["day"] += 1
+    await broadcast(rid, {"type":"system","text":f"Phase forcibly changed to {room['phase']} (Day {room['day']})"})
     await broadcast(rid, {"type":"room","room": room_summary(room)})
-    return {"ok": True, "phase": room["phase"], "day": room["day"]}
+    return {"ok": True}
 
-# === Phase controller: orchestrates segmented day timers and night timers ===
+# === Phase controller ===
 async def phase_controller_loop(room_id: str):
     room = rooms.get(room_id)
     if not room: return
-    # Day sequence: discussion -> voting -> defence -> final -> process lynch -> night
-    # Each subphase broadcasts the current subphase name and remaining seconds every 5s
-    async def broadcast_countdown(subphase_name, duration):
-        deadline = time.time() + duration
-        await broadcast(room_id, {"type":"phase","phase": subphase_name, "seconds": duration})
-        interval = 5
-        while True:
-            remaining = int(deadline - time.time())
-            if remaining <= 0:
-                await broadcast(room_id, {"type":"phase","phase": subphase_name, "seconds": 0})
-                break
-            if remaining % interval == 0:
-                await broadcast(room_id, {"type":"phase","phase": subphase_name, "seconds": remaining})
-            await asyncio.sleep(1)
     try:
         while room["state"] == "active":
             # DAY DISCUSSION
             room["phase"] = "day"
             await broadcast(room_id, {"type":"system","text":"🌞 Discussion time begins."})
-            await broadcast_countdown("discussion", DAY_DISCUSS)
+            await broadcast(room_id, {"type":"phase","phase":"discussion","seconds": DAY_DISCUSS})
+            # simulate bots voting/discussing mid-phase
+            asyncio.create_task(simulate_bot_discussion_and_votes(room_id))
+            await countdown_broadcast(room_id, DAY_DISCUSS)
             # VOTING
             await broadcast(room_id, {"type":"system","text":"🗳️ Voting time begins."})
-            await broadcast_countdown("voting", DAY_VOTE)
+            await broadcast(room_id, {"type":"phase","phase":"voting","seconds": DAY_VOTE})
+            # bots will cast some votes during this subphase
+            asyncio.create_task(simulate_bot_votes(room_id))
+            await countdown_broadcast(room_id, DAY_VOTE)
             # DEFENCE
             await broadcast(room_id, {"type":"system","text":"🗣️ Defence time for the accused."})
-            await broadcast_countdown("defence", DAY_DEFENCE)
+            await broadcast(room_id, {"type":"phase","phase":"defence","seconds": DAY_DEFENCE})
+            await countdown_broadcast(room_id, DAY_DEFENCE)
             # FINAL DECISION
             await broadcast(room_id, {"type":"system","text":"⏱️ Final decision time."})
-            await broadcast_countdown("final", DAY_FINAL)
-            # after final decision resolve votes (if majority)
+            await broadcast(room_id, {"type":"phase","phase":"final","seconds": DAY_FINAL})
+            await countdown_broadcast(room_id, DAY_FINAL)
+            # resolve votes after final
             await resolve_votes_if_ready(room_id)
             # NIGHT START
             room["phase"] = "night"
             await broadcast(room_id, {"type":"system","text":"🌙 Night begins. Use your night abilities."})
-            await broadcast(room_id, {"type":"room","room": room_summary(room)})
-            # allow faction chats: server trusts frontend to only show allowed chats; but we can broadcast allowed flags
-            await broadcast(room_id, {"type":"phase","phase":"night","seconds":NIGHT_DURATION, "allow": {"mafia":True,"cult":True,"medium":True,"cupid":True}})
-            # bots and humans can queue actions during night; wait NIGHT_DURATION then resolve
-            await asyncio.sleep(NIGHT_DURATION)
-            # resolve queued actions
+            # tell clients who can private-chat at night
+            await broadcast(room_id, {"type":"phase","phase":"night","seconds": NIGHT_DURATION, "allow": {"mafia": True, "cult": True, "medium": True, "lovers": True, "jailor_chat": True}})
+            # let bots act some time during the night
+            asyncio.create_task(simulate_bot_night_actions(room_id))
+            # wait NIGHT_DURATION then resolve queued actions
+            await countdown_broadcast(room_id, NIGHT_DURATION)
+            # resolve night actions
             await apply_player_actions(room_id)
+            # check victory
             await check_victory(room_id)
-            # loop continues; if game ended check_victory sets room state to ended
             if room.get("state") == "ended":
                 break
-    except Exception as e:
+            # continue loop -> next day
+            room["day"] += 1
+            await broadcast(room_id, {"type":"system","text":f"🌞 Day {room['day']} begins."})
+    except Exception:
         traceback.print_exc()
 
-# === Bot behavior (day votes & night acts) ===
-async def perform_bot_day_actions(room_id: str):
-    room = rooms.get(room_id)
-    if not room or room["phase"] != "day" or room["state"] != "active": return
-    alive_players = [p for p in room["players"] if p["alive"]]
-    for bot in [p for p in alive_players if p["is_bot"]]:
-        choices = [p["name"] for p in alive_players if p["name"] != bot["name"]]
-        if not choices: continue
-        # simulate timing: bots vote mid-way through voting period; but since controller runs everything,
-        # they will be added whenever perform_bot_day_actions is triggered.
-        tgt = sample(choices)
-        room.setdefault("votes", {})[bot["name"]] = tgt
-        await broadcast(room_id, {"type":"system","text":f"🤖 {bot['name']} voted for {tgt}"})
+async def countdown_broadcast(room_id: str, duration: int):
+    deadline = time.time() + duration
+    while True:
+        remaining = int(deadline - time.time())
+        if remaining < 0:
+            await broadcast(room_id, {"type":"phase","seconds": 0})
+            break
+        await broadcast(room_id, {"type":"phase","seconds": remaining})
+        await asyncio.sleep(1)
 
+# === Bot simulation helpers ===
+async def simulate_bot_discussion_and_votes(room_id: str):
+    # bots may send system notes and register tentative votes during discussion
+    room = rooms.get(room_id)
+    if not room or room["state"] != "active": return
+    await asyncio.sleep(DAY_DISCUSS//2)
+    alive = [p for p in room["players"] if p["alive"]]
+    for bot in [p for p in alive if p["is_bot"]]:
+        # sometimes bots vote even in discussion for realism
+        if random.random() < 0.3:
+            choices = [x["name"] for x in alive if x["name"] != bot["name"]]
+            if choices:
+                target = sample(choices)
+                room.setdefault("votes", {})[bot["name"]] = target
+                await broadcast(room_id, {"type":"system","text":f"🤖 {bot['name']} is leaning towards {target}"})
+
+async def simulate_bot_votes(room_id: str):
+    room = rooms.get(room_id)
+    if not room or room["state"] != "active": return
+    alive = [p for p in room["players"] if p["alive"]]
+    await asyncio.sleep(DAY_VOTE//2)
+    for bot in [p for p in alive if p["is_bot"]]:
+        if bot["name"] not in room.get("votes", {}):
+            choices = [x["name"] for x in alive if x["name"] != bot["name"]]
+            if choices:
+                room.setdefault("votes", {})[bot["name"]] = sample(choices)
+                await broadcast(room_id, {"type":"system","text":f"🤖 {bot['name']} voted for {room['votes'][bot['name']]} (auto)"})
+
+async def simulate_bot_night_actions(room_id: str):
+    room = rooms.get(room_id)
+    if not room or room["state"] != "active": return
+    await asyncio.sleep(NIGHT_DURATION//3)
+    alive = [p for p in room["players"] if p["alive"]]
+    # mafia action
+    mafia = [p for p in alive if p["faction"]=="Mafia"]
+    if mafia:
+        targets = [p for p in alive if p["faction"]!="Mafia"]
+        if targets:
+            victim = sample(targets)
+            room.setdefault("actions", []).append({"actor": sample(mafia)["name"], "target": victim["name"], "type":"mafia_kill", "actor_role":"Mafioso"})
+            await broadcast(room_id, {"type":"system","text":f"🤖 Mafia decided to target {victim['name']}"})
+    # cult tries to convert
+    cults = [p for p in alive if p["faction"]=="Cult"]
+    if cults and random.random() < 0.4:
+        candidates = [p for p in alive if p["faction"] not in ("Cult","Mafia")]
+        if candidates:
+            t = sample(candidates)
+            room.setdefault("actions", []).append({"actor": sample(cults)["name"], "target": t["name"], "type":"cult_convert"})
+            await broadcast(room_id, {"type":"system","text":f"🤖 Cult attempted to convert {t['name']}"})
+    # serial killer
+    sk = [p for p in alive if p["role"]=="Serial Killer"]
+    if sk:
+        killer = sk[0]
+        targets = [p for p in alive if p["name"] != killer["name"]]
+        if targets:
+            t = sample(targets)
+            room.setdefault("actions", []).append({"actor": killer["name"], "target": t["name"], "type":"serial_kill", "actor_role":"Serial Killer"})
+            await broadcast(room_id, {"type":"system","text":f"🤖 Serial Killer chose a target."})
+    # other bot actions could be added similarly
+
+# === Voting resolution ===
 async def resolve_votes_if_ready(room_id: str):
     room = rooms.get(room_id)
     if not room: return
@@ -320,15 +384,13 @@ async def resolve_votes(room_id: str):
     if not room: return
     tally = {}
     for v in room.get("votes", {}).values():
-        tally[v] = tally.get(v,0)+1
+        tally[v] = tally.get(v,0) + 1
     room["votes"] = {}
     if not tally:
-        # no lynch
-        await broadcast(room_id, {"type":"system","text":"No consensus reached — no lynch."})
+        await broadcast(room_id, {"type":"system","text":"No consensus — no lynch."})
         return
-    # pick top vote
     top = max(tally, key=lambda k: tally[k])
-    victim = next((p for p in room["players"] if p["name"] == top and p["alive"]), None)
+    victim = next((p for p in room["players"] if p["name"]==top and p["alive"]), None)
     if victim:
         victim["alive"] = False
         await broadcast(room_id, {"type":"system","text":f"⚖️ {victim['name']} was lynched!"})
@@ -337,17 +399,15 @@ async def resolve_votes(room_id: str):
             if victim["name"] not in room["winners"]:
                 room["winners"].append(victim["name"])
                 await broadcast(room_id, {"type":"system","text":f"😈 {victim['name']} (Jester) achieved their win!"})
-        # executioner checks
+        # executioner check
         for exec_name, targ in list(room.get("execution_targets", {}).items()):
             if targ == victim["name"]:
                 if exec_name not in room["winners"]:
                     room["winners"].append(exec_name)
                     await broadcast(room_id, {"type":"system","text":f"🔨 {exec_name} (Executioner) achieved their win!"})
-        # reveal by default (lynch reveal)
         await reveal_death(room_id, victim)
-    # after lynch, phase will proceed to night by controller
 
-# === Action queue endpoint (allow clients to queue night actions) ===
+# === Queue action endpoint ===
 @app.post("/queue-action")
 async def queue_action(body: dict = Body(...)):
     room_id = body.get("room_id"); actor = body.get("actor"); target = body.get("target"); atype = body.get("type")
@@ -358,7 +418,7 @@ async def queue_action(body: dict = Body(...)):
     await broadcast(room_id, {"type":"system","text":f"{actor} queued action {atype} -> {target}"})
     return {"ok": True}
 
-# === Core action resolution: doctor protection and beastman bypass ===
+# === Apply night actions with doctor logic and beastman bypass + other mechanics ===
 async def apply_player_actions(room_id: str):
     room = rooms.get(room_id)
     if not room: return
@@ -368,64 +428,288 @@ async def apply_player_actions(room_id: str):
     janitor_cleans = set()
     queued_kills = []
     queued_converts = []
-    # first pass: collect actions
+    queued_jails = []   # tuple (jailor_name, target_name, execute_flag)
+    queued_investigations = []
+    queued_medium_msgs = []
+    # Collect actions
     for action in actions:
-        actor_name = action.get("actor"); target_name = action.get("target"); atype = action.get("type","")
-        actor = next((p for p in room["players"] if p["name"]==actor_name), None)
-        target = next((p for p in room["players"] if p["name"]==target_name), None)
-        if not actor or not target:
+        actor = action.get("actor"); target = action.get("target"); atype = action.get("type",""); actor_role = action.get("actor_role")
+        actor_p = next((p for p in room["players"] if p["name"]==actor), None)
+        target_p = next((p for p in room["players"] if p["name"]==target), None)
+        if not actor_p:
             continue
-        # Doctor heal: adds to protected set that prevents kills (except beast_kill)
+        # Doctor heal: protection applied regardless of order (doctor heal prevents kills except Beastman)
         if atype == "doctor_heal":
-            protected_by_doctor.add(target_name)
+            protected_by_doctor.add(target)
+            await broadcast(room_id, {"type":"system","text":f"🩺 {actor} healed {target} (doctor)."})
         elif atype == "bodyguard_protect":
-            protected_by_bodyguard.add(target_name)
+            protected_by_bodyguard.add(target)
+            await broadcast(room_id, {"type":"system","text":f"🛡️ {actor} is protecting {target} (bodyguard)."})
         elif atype == "janitor_clean":
-            # janitor intends to clean corpse; we'll check that corpse exists and was killed
-            janitor_cleans.add(target_name)
+            janitor_cleans.add(target)
+            await broadcast(room_id, {"type":"system","text":f"🧹 {actor} intends to clean {target}'s body."})
         elif atype == "cupid_link":
-            # store lovers mapping (actor <-> target)
-            if actor and not actor.get("cupid_used"):
-                room["lovers"][actor_name] = target_name
-                room["lovers"][target_name] = actor_name
-                actor["cupid_used"] = True
-                # private messages to lovers if connected
-                for lover in (actor_name, target_name):
+            if not actor_p.get("cupid_used", False):
+                room["lovers"][actor] = target
+                room["lovers"][target] = actor
+                actor_p["cupid_used"] = True
+                await broadcast(room_id, {"type":"system","text":f"💞 Cupid linked {actor} and {target}."})
+                # private message to lovers
+                for lover in (actor, target):
                     p = next((pp for pp in room["players"] if pp["name"]==lover), None)
                     if p and p.get("ws_id"):
                         ws = room_ws[room_id].sockets.get(p["ws_id"])
                         if ws:
-                            try: await ws.send_text(json.dumps({"type":"private","to":lover,"text":"You are now linked as lovers."}))
+                            try: await ws.send_text(json.dumps({"type":"private","to":lover,"text":"You are now lovers."}))
                             except: pass
-                await broadcast(room_id, {"type":"system","text":f"💞 {actor_name} and {target_name} are linked by Cupid."})
-        elif atype in ("mafia_kill","lynch_kill","serial_kill","beast_kill","beastman_kill"):
-            queued_kills.append({"victim": target_name, "by": actor_name, "type": atype, "actor_role": actor.get("role")})
+        elif atype == "mafia_kill":
+            queued_kills.append({"victim": target, "by": actor, "type":"mafia_kill", "actor_role": actor_p.get("role")})
+        elif atype in ("beast_kill","beastman_kill"):
+            queued_kills.append({"victim": target, "by": actor, "type":"beast_kill", "actor_role": actor_p.get("role")})
+        elif atype == "serial_kill":
+            queued_kills.append({"victim": target, "by": actor, "type":"serial_kill", "actor_role": actor_p.get("role")})
         elif atype == "cult_convert":
-            queued_converts.append({"target": target_name, "by": actor_name})
-        elif atype == "executioner_set":
-            room["execution_targets"][actor_name] = target_name
-    # apply converts first
+            queued_converts.append({"target": target, "by": actor})
+        elif atype == "jail":
+            queued_jails.append({"jailor": actor, "target": target, "execute": action.get("execute", False)})
+        elif atype == "detective_check":
+            queued_investigations.append({"investigator": actor, "target": target, "role": actor_p.get("role")})
+        # other abilities (witch, arsonist ignite, guardian, vigilante, etc.) represented as actions too
+
+        elif atype == "vigilante_shot":
+            # vigilante: allowed only if off cooldown and target is mafia (including culted mafia)
+            queued_kills.append({"victim": target, "by": actor, "type":"vigilante_shot", "actor_role": actor_p.get("role")})
+
+    # Apply converts first (affects faction checks later)
     for c in queued_converts:
-        target = next((p for p in room["players"] if p["name"]==c["target"] and p["alive"]), None)
-        if target and target["role"] not in ("Godfather","Mafioso","Janitor","Beastman","Soldier"):
-            target["faction"] = "Cult"
-            target["role"] = "Acolyte"
-            await broadcast(room_id, {"type":"system","text":f"✨ {target['name']} was converted to the Cult!"})
-    # resolve kills with doctor protection rule: patient in protected_by_doctor survives all kills except when killer is Beastman or kill type is beast_kill
-    final_kill_names = []
+        t = next((p for p in room["players"] if p["name"]==c["target"] and p["alive"]), None)
+        if t and t["role"] not in ("Godfather","Mafioso","Beastman","Soldier"):
+            t["faction"] = "Cult"
+            t["role"] = "Acolyte"
+            await broadcast(room_id, {"type":"system","text":f"✨ {t['name']} was converted to the Cult!"})
+
+    # Apply jails: jailed players cannot be targeted by others
+    jailed_names = set()
+    for j in queued_jails:
+        jailor = j["jailor"]; tgt = j["target"]; exec_flag = j["execute"]
+        jailed_names.add(tgt)
+        # if execute flag set, process execution immediately (perform a lynch-style result)
+        jailor_p = next((p for p in room["players"] if p["name"]==jailor), None)
+        tgt_p = next((p for p in room["players"] if p["name"]==tgt and p["alive"]), None)
+        if exec_flag and jailor_p and jailor_p.get("jailor_has_execute", True):
+            # execute the jailed target
+            if tgt_p:
+                tgt_p["alive"] = False
+                await broadcast(room_id, {"type":"system","text":f"⚖️ {tgt_p['name']} was executed by Jailor {jailor}!"})
+                await reveal_death(room_id, tgt_p)
+            # if executed a Town member and jailor misused, lose execution permanently
+            if tgt_p and tgt_p["faction"] == "Town":
+                jailor_p["jailor_has_execute"] = False
+                await broadcast(room_id, {"type":"system","text":f"⚠️ {jailor}'s execute targeted a Town member — they lose execution ability."})
+
+    # Resolve kills with Cupid sacrifice and Doctor protection (beast bypass)
+    final_kills = []
     for k in queued_kills:
         victim = k["victim"]
-        killer_role = k.get("actor_role","")
+        actor_role = k.get("actor_role","")
         kill_type = k.get("type","")
-        # Cupid sacrifice rule: if victim has lover who is alive -> lover dies instead (sacrifice)
+        # if target is jailed, skip (protected)
+        if victim in jailed_names:
+            await broadcast(room_id, {"type":"system","text":f"🔒 {victim} was jailed and could not be targeted."})
+            continue
+        # Cupid sacrifice: if victim has lover alive -> lover dies instead
         lover = room["lovers"].get(victim)
         if lover and any(p["name"]==lover and p["alive"] for p in room["players"]):
-            final_kill_names.append(lover)
-            await broadcast(room_id, {"type":"system","text":f"💔 {lover} sacrificed themself for their lover {victim}!"})
+            final_kills.append({"name": lover, "killed_by": k["by"], "type": kill_type, "actor_role": actor_role})
+            await broadcast(room_id, {"type":"system","text":f"💔 {lover} sacrificed themselves for their lover {victim}!"})
         else:
-            final_kill_names.append(victim)
+            final_kills.append({"name": victim, "killed_by": k["by"], "type": kill_type, "actor_role": actor_role})
+
     applied_dead = set()
-    for name in set(final_kill_names):
-        # check protections
-        bypass = False
-        # if ANY queued kill on this name
+    for entry in final_kills:
+        name = entry["name"]
+        kill_type = entry["type"]
+        actor_role = entry.get("actor_role","")
+        # determine if doctor protection applies and whether beastman bypasses it
+        bypass = (actor_role == "Beastman") or (kill_type in ("beast_kill","beastman_kill"))
+        if (name in protected_by_doctor or name in protected_by_bodyguard) and (not bypass):
+            await broadcast(room_id, {"type":"system","text":f"🛡️ {name} was attacked but survived (protected)."})
+            continue
+        # victim dies
+        victim = next((p for p in room["players"] if p["name"]==name and p["alive"]), None)
+        if victim:
+            victim["alive"] = False
+            # if janitor cleaned, hide reveal
+            if name not in janitor_cleans:
+                await reveal_death(room_id, victim)
+            else:
+                victim["revealed"] = False
+                await broadcast(room_id, {"type":"system","text": f"⚠️ A corpse was found but has been cleaned; role hidden."})
+            applied_dead.add(name)
+            # extra checks: if victim role Jester, Executioner etc. handled on reveal/lynch earlier
+    # clear actions
+    room["actions"] = []
+    # broadcast room change
+    await broadcast(room_id, {"type":"room","room": room_summary(room)})
+
+# reveal helper
+async def reveal_death(room_id: str, player):
+    if not player.get("revealed", False):
+        player["revealed"] = True
+    msg = f"💀 {player['name']} was the {player['role']} ({player['faction']})!"
+    await broadcast(room_id, {"type":"system","text": msg})
+
+# === Victory & end game ===
+async def check_victory(room_id: str):
+    room = rooms.get(room_id)
+    if not room: return
+    alive = [p for p in room["players"] if p["alive"]]
+    mafia_alive = [p for p in alive if p["faction"]=="Mafia"]
+    cult_alive = [p for p in alive if p["faction"]=="Cult"]
+    town_alive = [p for p in alive if p["faction"]=="Town"]
+    neutral_alive = [p for p in alive if p["faction"]=="Neutral"]
+    if not mafia_alive and not cult_alive:
+        await end_game(room_id, "Town"); return
+    if not town_alive and len(mafia_alive) >= len(cult_alive):
+        await end_game(room_id, "Mafia"); return
+    if len(cult_alive) >= len(mafia_alive) + len(town_alive):
+        await end_game(room_id, "Cult"); return
+    if not any([mafia_alive, cult_alive, town_alive]) and neutral_alive:
+        await end_game(room_id, "Neutral"); return
+
+async def end_game(room_id: str, winner_faction: str):
+    room = rooms.get(room_id)
+    if not room: return
+    room["state"] = "ended"; room["winner"] = winner_faction
+    if winner_faction == "Town":
+        msg = "🌼 The Town has purged the darkness and won!"
+    elif winner_faction == "Mafia":
+        msg = "💀 The Mafia controls the shadows — they win!"
+    elif winner_faction == "Cult":
+        msg = "🔮 The Cult dominates!"
+    else:
+        msg = "⚖️ Neutrals outlived all others!"
+    await broadcast(room_id, {"type":"system","text": msg})
+    await asyncio.sleep(1)
+    if room.get("winners"):
+        await broadcast(room_id, {"type":"system","text": "🏆 Individual winners: " + ", ".join(room["winners"])})
+    recap = "\n".join([f"{p['name']}: {p['role']} ({p['faction']}) {'✅' if p['alive'] else '💀'}" for p in room["players"]])
+    await broadcast(room_id, {"type":"system","text": "📜 Final Roles:\n" + recap})
+    await broadcast(room_id, {"type":"room","room": room_summary(room)})
+
+# === WebSocket endpoint ===
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    await websocket.accept()
+    wsid = str(uuid4())
+    room = rooms.get(room_id)
+    if not room:
+        await websocket.send_text(json.dumps({"type":"system","text":"Room not found"}))
+        await websocket.close(); return
+    room["sockets"][wsid] = None
+    room_ws[room_id].sockets[wsid] = websocket
+    try:
+        await websocket.send_text(json.dumps({"type":"system","text":f"Connected to room {room_id}", "ws_id": wsid}))
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+            except:
+                await websocket.send_text(json.dumps({"type":"system","text":"Invalid JSON"})); continue
+            mtype = msg.get("type")
+            if mtype == "identify":
+                slot = msg.get("slot")
+                p = next((pp for pp in room["players"] if pp["slot"]==slot), None)
+                if p:
+                    p["ws_id"] = wsid; p["is_bot"] = False; room["sockets"][wsid] = p["name"]
+                    await websocket.send_text(json.dumps({"type":"system","text":f"You are {p['name']} (slot {p['slot']})"}))
+                    if room["state"] == "active":
+                        await websocket.send_text(json.dumps({"type":"private_role","slot":p["slot"],"role":p["role"],"faction":p["faction"],"explain":role_explain(p["role"],p["faction"])}))
+                    await broadcast(room_id, {"type":"room","room": room_summary(room)})
+            elif mtype == "create_room":
+                r = create_room_object(msg.get("name","Host"))
+                await websocket.send_text(json.dumps({"type":"room_info","room": room_summary(r), "roomId": r["id"]}))
+            elif mtype == "join_room":
+                slot = next((p for p in room["players"] if p["is_bot"]), None)
+                if not slot:
+                    await websocket.send_text(json.dumps({"type":"system","text":"Room full"})); continue
+                slot["is_bot"] = False; slot["name"] = msg.get("name","Player"); slot["ws_id"] = wsid; room["sockets"][wsid] = slot["name"]
+                await websocket.send_text(json.dumps({"type":"private_role","slot":slot["slot"],"role":slot["role"],"faction":slot["faction"],"explain":role_explain(slot["role"],slot["faction"])}))
+                await broadcast(room_id, {"type":"system","text":f"{slot['name']} joined as {slot['slot']}"})
+                await broadcast(room_id, {"type":"room","room": room_summary(room)})
+            elif mtype == "start_game":
+                try:
+                    await start_game(room_id)
+                except Exception as e:
+                    await websocket.send_text(json.dumps({"type":"system","text":str(e)}))
+            elif mtype == "player_action":
+                action = msg.get("action")
+                if action:
+                    room.setdefault("actions", []).append(action)
+                    await websocket.send_text(json.dumps({"type":"system","text":"Action queued"}))
+            elif mtype == "vote":
+                slot = msg.get("slot"); target = msg.get("target")
+                p = next((pp for pp in room["players"] if pp["slot"]==slot), None)
+                if p:
+                    room.setdefault("votes", {})[p["name"]] = target
+                    await broadcast(room_id, {"type":"system","text":f"{p['name']} voted for {target}"})
+                    await resolve_votes_if_ready(room_id)
+            elif mtype == "chat":
+                # chat routing: include 'channel' optional: 'public', 'mafia', 'cult', 'lovers', 'medium'
+                channel = msg.get("channel", "public")
+                text = msg.get("text","")
+                sender = msg.get("from","")
+                # broadcast based on channel
+                if channel == "public":
+                    await broadcast(room_id, {"type":"chat","from":sender,"text":text,"channel":"public"})
+                elif channel == "mafia":
+                    # send to mafia members only
+                    for p in room["players"]:
+                        if p["faction"] == "Mafia" and p.get("ws_id"):
+                            ws = room_ws[room_id].sockets.get(p["ws_id"])
+                            if ws:
+                                try: await ws.send_text(json.dumps({"type":"chat","from":sender,"text":text,"channel":"mafia"}))
+                                except: pass
+                elif channel == "cult":
+                    for p in room["players"]:
+                        if p["faction"] == "Cult" and p.get("ws_id"):
+                            ws = room_ws[room_id].sockets.get(p["ws_id"])
+                            if ws:
+                                try: await ws.send_text(json.dumps({"type":"chat","from":sender,"text":text,"channel":"cult"}))
+                                except: pass
+                elif channel == "lovers":
+                    # lovers chat: send only to lover pair
+                    lover = next((pp for pp in room["players"] if pp["name"]==sender), None)
+                    if lover:
+                        partner = room["lovers"].get(sender)
+                        for nm in (sender, partner):
+                            p = next((pp for pp in room["players"] if pp["name"]==nm and pp.get("ws_id")), None)
+                            if p:
+                                ws = room_ws[room_id].sockets.get(p["ws_id"])
+                                if ws:
+                                    try: await ws.send_text(json.dumps({"type":"chat","from":sender,"text":text,"channel":"lovers"}))
+                                    except: pass
+                elif channel == "medium":
+                    # medium chat with dead: send to mediums (alive) and dead players' ws (if they had ws)
+                    for p in room["players"]:
+                        if (p["role"]=="Medium" and p.get("ws_id")) or (not p["alive"] and p.get("ws_id")):
+                            ws = room_ws[room_id].sockets.get(p["ws_id"])
+                            if ws:
+                                try: await ws.send_text(json.dumps({"type":"chat","from":sender,"text":text,"channel":"medium"}))
+                                except: pass
+                else:
+                    await broadcast(room_id, {"type":"chat","from":sender,"text":text,"channel":channel})
+            else:
+                await websocket.send_text(json.dumps({"type":"system","text":"Unknown message type"}))
+    except WebSocketDisconnect:
+        s = room["sockets"].pop(wsid, None)
+        room_ws[room_id].sockets.pop(wsid, None)
+        if s:
+            p = next((pp for pp in room["players"] if pp["name"]==s), None)
+            if p:
+                p["is_bot"] = True; p["ws_id"] = None
+        await broadcast(room_id, {"type":"system","text":"A player disconnected"})
+    except Exception as e:
+        traceback.print_exc()
+        try: await websocket.send_text(json.dumps({"type":"system","text":"Server error: "+str(e)}))
+        except: pass
