@@ -497,4 +497,4 @@ async def simulate_bot_night_actions(room_id: str):
         if candidates:
             t = random.choice(candidates)
             room.setdefault("actions", []).append({"actor": random.choice(cults)["name"], "target": t["name"], "type":"cult_convert"})
-            await send_to_faction(room_i
+            await send_to_faction(room_id)
