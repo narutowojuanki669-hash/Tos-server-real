@@ -1,22 +1,22 @@
-# main.py — Town of Shadows backend (Step 3: Night actions + Day voting/defence/verdict)
+# main.py — Town of Shadows full backend (Step 3 complete)
 # Deploy with: uvicorn main:app --host 0.0.0.0 --port 10000
 
 import asyncio
 import json
 import random
 import time
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, List, Set, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Town of Shadows - Step 3")
+app = FastAPI(title="Town of Shadows - Full Backend (Step 3)")
 
-# Update FRONTEND_URL to your Netlify URL
+# ---------------- CONFIG ----------------
+# Update if your frontend URL changes
 FRONTEND_URL = "https://effortless-cobbler-2ab85b.netlify.app"
-BACKEND_BASE = "https://town-of-shadows-server.onrender.com"
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- CONFIG ----------------
 TOTAL_PLAYERS = 20
 NIGHT_SECONDS = 40
 DAY_DISCUSS = 60
@@ -49,8 +48,8 @@ class QueueActionReq(BaseModel):
     target: str
     type: str
 
-# ---------------- IN-MEM STATE ----------------
-rooms: Dict[str, Any] = {}                # room_id -> room object
+# ---------------- IN-MEMORY STATE ----------------
+rooms: Dict[str, Dict[str, Any]] = {}
 ws_managers: Dict[str, Dict[str, WebSocket]] = {}  # room_id -> {wsid: websocket}
 
 # ---------------- ROLE POOLS ----------------
@@ -67,35 +66,31 @@ def role_to_faction(role: str) -> str:
     return "Unknown"
 
 # ---------------- HELPERS ----------------
-def sample_roles_for_game():
-    """Return a list of 20 roles matching counts: Town 8 / Mafia 5 / Cult 4 / Neutrals 3"""
-    roles = []
+def sample_roles_for_game() -> List[str]:
+    """Return roles matching: Town 8 / Mafia 5 / Cult 4 / Neutrals 3 (total 20)."""
+    roles: List[str] = []
     roles.extend(random.sample(TOWN_POOL, min(8, len(TOWN_POOL))))
-    # mafia ensure Godfather + one Mafioso at least
     mafia = ["Godfather","Mafioso"]
     remaining = [r for r in MAFIA_POOL if r not in mafia]
     while len(mafia) < 5:
         mafia.append(random.choice(remaining) if random.random() < 0.5 else "Mafioso")
     roles.extend(mafia)
-    # cult
     cult = ["Cult Leader","Fanatic"]
     other_cult = [r for r in CULT_POOL if r not in cult]
     while len(cult) < 4:
         cult.append(random.choice(other_cult))
     roles.extend(cult)
-    # neutrals
     roles.extend(random.sample(NEUTRAL_POOL, 3))
-    # fill remaining if any
     while len(roles) < TOTAL_PLAYERS:
         roles.append(random.choice(TOWN_POOL))
     random.shuffle(roles)
     return roles
 
-def create_room_obj(host_name="Host", total_slots: int = TOTAL_PLAYERS):
+def create_room_obj(host_name: str = "Host", total_slots: int = TOTAL_PLAYERS) -> Dict[str, Any]:
     rid = str(uuid4())[:6].upper()
     roles = sample_roles_for_game()
     players = []
-    for i in range(1, total_slots + 1):
+    for i in range(1, total_slots+1):
         r = roles[i-1]
         players.append({
             "slot": i,
@@ -107,10 +102,10 @@ def create_room_obj(host_name="Host", total_slots: int = TOTAL_PLAYERS):
             "ws_id": None,
             "revealed": False,
             "vigilante_last_shot_day": -99,
-            "jailor_has_execute": True if r=="Jailor" else False,
+            "jailor_has_execute": True if r == "Jailor" else False,
             "soldier_used": False,
             "doused": False,
-            "contacted": False,  # for cult contact
+            "contacted": False,
         })
     room = {
         "id": rid,
@@ -119,15 +114,14 @@ def create_room_obj(host_name="Host", total_slots: int = TOTAL_PLAYERS):
         "state": "waiting",
         "phase": "waiting",
         "day": 0,
-        "actions": [],   # queued night actions
+        "actions": [],
         "votes": {},
-        "lovers": {},    # name->lover
+        "lovers": {},
         "controller_task": None,
         "cleaned_bodies": set(),
-        # day-specific
-        "accused": None,            # name of currently accused
-        "verdict_votes": {},        # name -> 'guilty'|'innocent'
-        "accusation_history": [],   # list of (day, accused)
+        "accused": None,
+        "verdict_votes": {},
+        "accusation_history": [],
     }
     rooms[rid] = room
     ws_managers[rid] = {}
@@ -147,14 +141,18 @@ def room_summary(room: Dict[str, Any]) -> Dict[str, Any]:
         "accused": room.get("accused")
     }
 
-# ---------------- REST API ----------------
+# ---------------- REST ROUTES ----------------
+@app.get("/test")
+async def test():
+    return {"message": "Hello from Town of Shadows backend"}
+
 @app.post("/create-room")
-def create_room(req: CreateRoomReq):
+async def create_room(req: CreateRoomReq):
     room = create_room_obj(req.host_name)
     return {"roomId": room["id"], "room": room_summary(room)}
 
 @app.post("/join-room")
-def join_room(req: JoinReq):
+async def join_room(req: JoinReq):
     rid = req.roomId
     if rid not in rooms:
         raise HTTPException(status_code=404, detail="Room not found")
@@ -167,7 +165,7 @@ def join_room(req: JoinReq):
     return {"slot": slot["slot"], "role": slot["role"], "faction": slot["faction"], "room": room_summary(room)}
 
 @app.get("/room/{room_id}")
-def get_room(room_id: str):
+async def get_room(room_id: str):
     if room_id not in rooms:
         raise HTTPException(status_code=404, detail="Room not found")
     return room_summary(rooms[room_id])
@@ -184,7 +182,7 @@ async def queue_action(req: QueueActionReq):
     await broadcast(room["id"], {"type":"system", "text": f"{req.actor} queued {req.type} -> {req.target}"})
     return {"ok": True}
 
-# ---------------- WebSocket ----------------
+# ---------------- WEBSOCKET ----------------
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await websocket.accept()
@@ -200,17 +198,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
-            except:
-                await websocket.send_text(json.dumps({"type":"system","text":"Invalid JSON"})); continue
+            except Exception:
+                await websocket.send_text(json.dumps({"type":"system","text":"Invalid JSON"}))
+                continue
             mtype = msg.get("type")
-            # Identify
+            # identify
             if mtype == "identify":
                 slot = msg.get("slot")
                 p = next((x for x in rooms[room_id]["players"] if x["slot"] == slot), None)
                 if p:
                     p["ws_id"] = wsid
                     p["is_bot"] = False
-                    # send private role
                     try:
                         await websocket.send_text(json.dumps({"type":"private_role","slot":p["slot"],"role":p["role"],"faction":p["faction"],"explain":f"Faction: {p['faction']}"}))
                     except:
@@ -223,7 +221,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 if action:
                     room = rooms[room_id]
                     if room["phase"].lower().startswith("day"):
-                        await websocket.send_text(json.dumps({"type":"system","text":"Actions only allowed at night"})); continue
+                        await websocket.send_text(json.dumps({"type":"system","text":"Actions only allowed at night"}))
+                        continue
                     room.setdefault("actions", []).append({"actor": action.get("actor"), "target": action.get("target"), "type": action.get("type"), "ts": time.time(), "actor_role": action.get("actor_role")})
                     await websocket.send_text(json.dumps({"type":"system","text":"Action queued"}))
             elif mtype == "chat":
@@ -233,11 +232,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 await broadcast(room_id, {"type":"chat","from":sender,"text":text,"channel":ch})
             elif mtype == "start_game":
                 try:
-                    await start_game(room_id)
+                    await start_game_ws(room_id)
                 except Exception as e:
                     await websocket.send_text(json.dumps({"type":"system","text":str(e)}))
             elif mtype == "accuse":
-                # only during voting subphase
                 room = rooms[room_id]
                 if not room["phase"].lower().startswith("day"):
                     await websocket.send_text(json.dumps({"type":"system","text":"Accusations only during day voting period"})); continue
@@ -254,7 +252,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 room.setdefault("verdict_votes", {})[voter] = choice
                 await broadcast(room_id, {"type":"system","text": f"{voter} voted {choice} on {room['accused']}"})
             elif mtype == "vote":
-                # direct vote during voting stage (alternative to accuse)
                 room = rooms[room_id]
                 if not room["phase"].lower().startswith("day"):
                     await websocket.send_text(json.dumps({"type":"system","text":"Voting only during day"})); continue
@@ -284,7 +281,7 @@ async def broadcast_phase(room_id: str, phase_name: str, seconds: int):
     await broadcast(room_id, {"type":"phase","phase":phase_name,"seconds":seconds})
     await broadcast(room_id, {"type":"room","room": room_summary(rooms[room_id])})
 
-# ---------------- START GAME ----------------
+# ---------------- GAME START (REST) ----------------
 @app.post("/start-game/{room_id}")
 async def start_game(room_id: str):
     if room_id not in rooms:
@@ -295,7 +292,7 @@ async def start_game(room_id: str):
     room["state"] = "active"
     room["day"] = 0
     room["phase"] = "night"
-    # announce and send private roles to connected humans
+    # send private roles to connected humans
     mgr = ws_managers.get(room_id, {})
     for wsid, ws in mgr.items():
         p = next((x for x in room["players"] if x.get("ws_id") == wsid), None)
@@ -310,6 +307,11 @@ async def start_game(room_id: str):
         room["controller_task"] = asyncio.create_task(phase_controller(room_id))
     return {"ok": True, "room": room_summary(room)}
 
+# ---------------- GAME START (WS wrapper) ----------------
+async def start_game_ws(room_id: str):
+    # wrapper to call start_game logic from WS
+    return await start_game(room_id)
+
 # ---------------- PHASE CONTROLLER ----------------
 async def phase_controller(room_id: str):
     room = rooms.get(room_id)
@@ -320,176 +322,41 @@ async def phase_controller(room_id: str):
         # NIGHT
         room["phase"] = "night"
         await broadcast_phase(room_id, f"Night {cycle}", NIGHT_SECONDS)
-        # bots act and humans queue actions
         asyncio.create_task(simulate_bot_night_actions(room_id))
         await asyncio.sleep(NIGHT_SECONDS)
-        # resolve all night actions
         await apply_player_actions(room_id)
-        # check victory after night
         await check_victory(room_id)
-        if room["state"] != "active": break
-        # DAY - structured
+        if room["state"] != "active":
+            break
+        # DAY
         room["day"] += 1
-        # DISCUSSION
         room["phase"] = "day"
+        # discussion
         await broadcast_phase(room_id, f"Day {room['day']} (Discussion)", DAY_DISCUSS)
         await asyncio.sleep(DAY_DISCUSS)
-        # VOTING / ACCUSATION
-        await broadcast_phase(room_id, f"Day {room['day']} (Voting)", DAY_VOTE)
-        # Reset daily votes container
+        # voting
         room["votes"] = {}
+        await broadcast_phase(room_id, f"Day {room['day']} (Voting)", DAY_VOTE)
         asyncio.create_task(simulate_bot_day_votes_and_accusations(room_id))
         await asyncio.sleep(DAY_VOTE)
-        # After voting period, determine accused (most-voted)
         await determine_accused(room_id)
-        # DEFENCE
+        # defence
         await broadcast_phase(room_id, f"Day {room['day']} (Defence)", DAY_DEFENCE)
         await asyncio.sleep(DAY_DEFENCE)
-        # FINAL VERDICT
+        # final verdict
         if room.get("accused"):
             room["verdict_votes"] = {}
             await broadcast(room_id, {"type":"verdict_phase","accused": room["accused"], "seconds": DAY_FINAL})
             await broadcast_phase(room_id, f"Day {room['day']} (Final Verdict)", DAY_FINAL)
             asyncio.create_task(simulate_bot_verdict_votes(room_id))
             await asyncio.sleep(DAY_FINAL)
-            # Resolve verdict votes
             await resolve_verdict(room_id)
         else:
-            # no accused -> skip final
             await broadcast(room_id, {"type":"system","text":"No accused this day."})
             await asyncio.sleep(DAY_FINAL)
-        # end of day, continue
         cycle += 1
 
-# ---------------- BOT DAY BEHAVIOR ----------------
-async def simulate_bot_day_votes_and_accusations(room_id: str):
-    """Bots sometimes accuse and vote during the voting subphase. Keep behavior natural: sometimes skip."""
-    room = rooms.get(room_id)
-    if not room or room["state"] != "active": return
-    await asyncio.sleep(max(1, DAY_VOTE//3))
-    alive = [p for p in room["players"] if p["alive"]]
-    # bots will sometimes accuse; probability varies
-    for bot in [p for p in alive if p["is_bot"]]:
-        if random.random() < 0.55:  # 55% chance to do something
-            # decide to accuse or to abstain
-            if random.random() < 0.6:
-                # pick suspicious target with weight (mafia/cult heavier)
-                candidates = [c for c in alive if c["name"] != bot["name"]]
-                if not candidates: continue
-                weights = []
-                for c in candidates:
-                    w = 1.0
-                    if c["faction"] in ("Mafia","Cult"): w = 3.0
-                    # prefer non-bot humans less often
-                    w *= (0.8 + random.random()*0.8)
-                    weights.append((c, w))
-                total = sum(w for _,w in weights)
-                r = random.random()*total
-                upto = 0
-                pick = weights[-1][0]
-                for c,w in weights:
-                    upto += w
-                    if r <= upto:
-                        pick = c; break
-                room.setdefault("votes", {})[bot["name"]] = pick["name"]
-                await broadcast(room_id, {"type":"system","text": f"🤖 {bot['name']} accused {pick['name']}"})
-            else:
-                # abstain (no vote)
-                pass
-
-async def simulate_bot_verdict_votes(room_id: str):
-    room = rooms.get(room_id)
-    if not room or room["state"] != "active": return
-    accused = room.get("accused")
-    if not accused: return
-    alive = [p for p in room["players"] if p["alive"]]
-    await asyncio.sleep(max(1, DAY_FINAL//2))
-    for bot in [p for p in alive if p["is_bot"]]:
-        # decide guilty or innocent
-        # bots of mafia faction lean innocent; town lean guilty if suspect
-        if bot["faction"] == "Mafia":
-            choice = "innocent" if random.random() < 0.7 else "guilty"
-        elif bot["faction"] == "Cult":
-            choice = "innocent" if random.random() < 0.6 else "guilty"
-        else:
-            choice = "guilty" if random.random() < 0.55 else "innocent"
-        room.setdefault("verdict_votes", {})[bot["name"]] = choice
-        await broadcast(room_id, {"type":"system","text": f"🤖 {bot['name']} voted {choice} on {accused}"})
-
-# ---------------- DETERMINE ACCUSED ----------------
-async def determine_accused(room_id: str):
-    room = rooms.get(room_id)
-    if not room: return
-    votes = room.get("votes", {}) or {}
-    if not votes:
-        room["accused"] = None
-        await broadcast(room_id, {"type":"system","text":"No accusations were made."})
-        await broadcast(room_id, {"type":"accused_update","accused": None})
-        return
-    tally = {}
-    for v in votes.values():
-        tally[v] = tally.get(v, 0) + 1
-    if not tally:
-        room["accused"] = None
-        await broadcast(room_id, {"type":"accused_update","accused": None})
-        return
-    top = max(tally, key=lambda k: tally[k])
-    # Check tie
-    counts = sorted(tally.values(), reverse=True)
-    if len(counts) > 1 and counts[0] == counts[1]:
-        # tie -> no accused
-        room["accused"] = None
-        await broadcast(room_id, {"type":"system","text":"Tie in accusations — no one accused."})
-        await broadcast(room_id, {"type":"accused_update","accused": None})
-        return
-    # else accused
-    room["accused"] = top
-    room.setdefault("accusation_history", []).append((room["day"], top))
-    await broadcast(room_id, {"type":"system","text": f"{top} has been accused and will defend themselves."})
-    await broadcast(room_id, {"type":"accused_update","accused": top})
-
-# ---------------- RESOLVE VERDICT ----------------
-async def resolve_verdict(room_id: str):
-    room = rooms.get(room_id)
-    if not room: return
-    accused = room.get("accused")
-    if not accused:
-        await broadcast(room_id, {"type":"system","text":"No accused to judge."})
-        return
-    votes = room.get("verdict_votes", {}) or {}
-    if not votes:
-        await broadcast(room_id, {"type":"system","text":"No verdict votes — no lynch."})
-        room["accused"] = None
-        await broadcast(room_id, {"type":"accused_update","accused": None})
-        return
-    tally = {"guilty":0, "innocent":0}
-    for v in votes.values():
-        tally[v] = tally.get(v,0) + 1
-    if tally["guilty"] > tally["innocent"]:
-        # accused executed
-        victim = next((p for p in room["players"] if p["name"]==accused and p["alive"]), None)
-        if victim:
-            victim["alive"] = False
-            # reveal unless cleaned
-            if accused not in room.get("cleaned_bodies", set()):
-                victim["revealed"] = True
-                await broadcast(room_id, {"type":"system","text": f"⚖️ {accused} was found GUILTY — {victim['role']} ({victim['faction']})"})
-            else:
-                await broadcast(room_id, {"type":"system","text": f"⚠️ {accused} was found guilty but corpse cleaned; role hidden."})
-            # clear accused
-            room["accused"] = None
-            room["verdict_votes"] = {}
-            await broadcast(room_id, {"type":"room","room": room_summary(room)})
-            # run victory check
-            await check_victory(room_id)
-            return
-    else:
-        await broadcast(room_id, {"type":"system","text": f"{accused} was found INNOCENT (tie or more innocent votes)."})
-    room["accused"] = None
-    room["verdict_votes"] = {}
-    await broadcast(room_id, {"type":"room","room": room_summary(room)})
-
-# ---------------- NIGHT BOT ACTIONS ----------------
+# ---------------- BOT ACTIONS (night) ----------------
 async def simulate_bot_night_actions(room_id: str):
     room = rooms.get(room_id)
     if not room or room["state"] != "active": return
@@ -517,7 +384,7 @@ async def simulate_bot_night_actions(room_id: str):
         if random.random() < 0.6:
             tgt = random.choice(alive)["name"]
             room.setdefault("actions", []).append({"actor": d["name"], "target": tgt, "type":"doctor_heal"})
-    # Bodyguard bots
+    # Bodyguard bots protect
     for bg in [p for p in alive if p["role"]=="Bodyguard"]:
         tgt = random.choice(alive)["name"]
         room.setdefault("actions", []).append({"actor": bg["name"], "target": tgt, "type":"bodyguard_protect"})
@@ -529,22 +396,25 @@ async def simulate_bot_night_actions(room_id: str):
                 tgt = random.choice(known_maf)["name"]
                 room.setdefault("actions", []).append({"actor": v["name"], "target": tgt, "type":"vigilante_shot"})
                 v["vigilante_last_shot_day"] = room["day"]
-    # Jailor bots jail randomly
+    # Jailor bots
     for j in [p for p in alive if p["role"]=="Jailor"]:
         tgt = random.choice([p for p in alive if p["name"]!=j["name"]])["name"]
-        # 30% chance to execute instead if jailor still has execute
         if j.get("jailor_has_execute", True) and random.random() < 0.12:
             room.setdefault("actions", []).append({"actor": j["name"], "target": tgt, "type":"jail_execute"})
         else:
             room.setdefault("actions", []).append({"actor": j["name"], "target": tgt, "type":"jail"})
-    # Janitor bots sometimes clean dead bodies
+    # Janitor bots clean
     for jan in [p for p in alive if p["role"]=="Janitor"]:
         if random.random() < 0.3:
             dead = [d for d in room["players"] if not d["alive"] and d["name"] not in room.get("cleaned_bodies", set())]
             if dead:
                 room.setdefault("actions", []).append({"actor": jan["name"], "target": dead[0]["name"], "type":"janitor_clean"})
+    # Serial killer bots
+    for sk in [p for p in alive if p["role"]=="Serial Killer"]:
+        tgt = random.choice([p for p in alive if p["name"]!=sk["name"]])["name"]
+        room.setdefault("actions", []).append({"actor": sk["name"], "target": tgt, "type":"serial_kill", "actor_role":"Serial Killer"})
 
-# ---------------- NIGHT ACTION RESOLUTION ----------------
+# ---------------- NIGHT RESOLUTION ----------------
 async def apply_player_actions(room_id: str):
     room = rooms.get(room_id)
     if not room: return
@@ -556,9 +426,8 @@ async def apply_player_actions(room_id: str):
     queued_converts = []
     jailed_targets: Set[str] = set()
     jailor_execs = []
-    investigations = []
 
-    # Collect actions
+    # collect actions
     for act in actions:
         a_type = act.get("type")
         actor = act.get("actor")
@@ -585,10 +454,7 @@ async def apply_player_actions(room_id: str):
             await broadcast(room_id, {"type":"system","text": f"🔒 {actor} jailed {target}."})
         elif a_type == "jail_execute":
             jailor_execs.append({"jailor": actor, "target": target})
-        elif a_type == "detective_check":
-            investigations.append({"investigator": actor, "target": target})
         elif a_type == "douse":
-            # arsonist style douse
             t = next((p for p in room["players"] if p["name"]==target), None)
             if t:
                 t["doused"] = True
@@ -596,7 +462,7 @@ async def apply_player_actions(room_id: str):
         else:
             pass
 
-    # Converts first (affects roles)
+    # converts first
     for conv in queued_converts:
         tname = conv["target"]
         target_p = next((p for p in room["players"] if p["name"]==tname and p["alive"]), None)
@@ -606,7 +472,7 @@ async def apply_player_actions(room_id: str):
                 target_p["role"] = "Acolyte"
                 await broadcast(room_id, {"type":"system","text": f"✨ {tname} was converted to the Cult!"})
 
-    # Handle jailor executes immediately
+    # jailor executes
     for je in jailor_execs:
         jailor = je["jailor"]; target = je["target"]
         jailor_p = next((p for p in room["players"] if p["name"]==jailor), None)
@@ -622,7 +488,7 @@ async def apply_player_actions(room_id: str):
                 jailor_p["jailor_has_execute"] = False
                 await broadcast(room_id, {"type":"system","text": f"⚠️ {jailor} executed a Town member and lost execution ability."})
 
-    # Prepare final kill targets with Cupid sacrifice handling
+    # prepare final kills (handle cupid sacrifice)
     final_kills = []
     for k in queued_kills:
         victim = k["victim"]
@@ -638,28 +504,26 @@ async def apply_player_actions(room_id: str):
                 continue
         final_kills.append({"name": victim, "killed_by": k["by"], "actor_role": k.get("actor_role"), "type": k.get("type")})
 
-    # Apply kills with protections
+    # apply kills with protections
     deaths = []
     for ent in final_kills:
         name = ent["name"]; actor_role = ent.get("actor_role",""); ktype = ent.get("type","")
-        # bodyguard protection
+        # bodyguard protect
         if name in protected_by_bodyguard:
             bg_name = protected_by_bodyguard[name]
             bg_p = next((p for p in room["players"] if p["name"]==bg_name and p["alive"]), None)
             if bg_p:
-                # beast bypass
                 if actor_role == "Beastman" or ktype in ("beast_kill","beastman_kill"):
                     bg_p["alive"] = False
                     deaths.append(bg_p["name"])
                     await broadcast(room_id, {"type":"system","text": f"🛡️ {bg_p['name']} (Bodyguard) died protecting {name} — Beastman bypassed protection."})
-                    # continue to apply kill to target
                 else:
                     bg_p["alive"] = False
                     deaths.append(bg_p["name"])
                     await broadcast(room_id, {"type":"system","text": f"🛡️ {bg_p['name']} (Bodyguard) died protecting {name} — {name} survived."})
                     continue
 
-        # soldier one-time protect
+        # soldier special
         target_p = next((p for p in room["players"] if p["name"]==name and p["alive"]), None)
         if target_p and target_p.get("role") == "Soldier" and not target_p.get("soldier_used", False):
             if actor_role == "Beastman" or ktype in ("beast_kill","beastman_kill"):
@@ -672,13 +536,13 @@ async def apply_player_actions(room_id: str):
                 await broadcast(room_id, {"type":"system","text": f"🛡️ {name} (Soldier) used their one-time protection and survived."})
                 continue
 
-        # doctor protection (non-beast)
+        # doctor protection
         bypass = (actor_role == "Beastman") or (ktype in ("beast_kill","beastman_kill"))
         if (name in protected_by_doctor) and (not bypass):
             await broadcast(room_id, {"type":"system","text": f"🛡️ {name} was attacked but survived due to Doctor protection."})
             continue
 
-        # if here, apply kill to alive target
+        # apply kill
         if target_p and target_p["alive"]:
             target_p["alive"] = False
             deaths.append(name)
@@ -688,18 +552,130 @@ async def apply_player_actions(room_id: str):
             else:
                 await broadcast(room_id, {"type":"system","text": f"⚠️ A corpse was found for {name}, but it was cleaned; role hidden."})
 
-    # Janitor cleans
+    # janitor cleans
     for cleaned in janitor_cleans:
         room.setdefault("cleaned_bodies", set()).add(cleaned)
         await broadcast(room_id, {"type":"system","text": f"🧹 {cleaned}'s body will be cleaned (role hidden)."})
 
-    # Clear actions and broadcast room
+    # clear actions and broadcast state
     room["actions"] = []
     await broadcast(room_id, {"type":"room","room": room_summary(room)})
-    # Victory checks
     await check_victory(room_id)
 
-# ---------------- VOTING / DAY HELPERS ----------------
+# ---------------- DAY BOT BEHAVIOR ----------------
+async def simulate_bot_day_votes_and_accusations(room_id: str):
+    room = rooms.get(room_id)
+    if not room or room["state"] != "active": return
+    await asyncio.sleep(max(1, DAY_VOTE//3))
+    alive = [p for p in room["players"] if p["alive"]]
+    for bot in [p for p in alive if p["is_bot"]]:
+        if random.random() < 0.55:
+            if random.random() < 0.6:
+                candidates = [c for c in alive if c["name"] != bot["name"]]
+                if not candidates: continue
+                weights = []
+                for c in candidates:
+                    w = 1.0
+                    if c["faction"] in ("Mafia","Cult"): w = 3.0
+                    w *= (0.8 + random.random()*0.8)
+                    weights.append((c, w))
+                total = sum(w for _,w in weights)
+                r = random.random()*total
+                upto = 0
+                pick = weights[-1][0]
+                for c,w in weights:
+                    upto += w
+                    if r <= upto:
+                        pick = c; break
+                room.setdefault("votes", {})[bot["name"]] = pick["name"]
+                await broadcast(room_id, {"type":"system","text": f"🤖 {bot['name']} accused {pick['name']}"})
+            else:
+                pass
+
+async def simulate_bot_verdict_votes(room_id: str):
+    room = rooms.get(room_id)
+    if not room or room["state"] != "active": return
+    accused = room.get("accused")
+    if not accused: return
+    alive = [p for p in room["players"] if p["alive"]]
+    await asyncio.sleep(max(1, DAY_FINAL//2))
+    for bot in [p for p in alive if p["is_bot"]]:
+        if bot["faction"] == "Mafia":
+            choice = "innocent" if random.random() < 0.7 else "guilty"
+        elif bot["faction"] == "Cult":
+            choice = "innocent" if random.random() < 0.6 else "guilty"
+        else:
+            choice = "guilty" if random.random() < 0.55 else "innocent"
+        room.setdefault("verdict_votes", {})[bot["name"]] = choice
+        await broadcast(room_id, {"type":"system","text": f"🤖 {bot['name']} voted {choice} on {accused}"})
+
+# ---------------- DETERMINE ACCUSED ----------------
+async def determine_accused(room_id: str):
+    room = rooms.get(room_id)
+    if not room: return
+    votes = room.get("votes", {}) or {}
+    if not votes:
+        room["accused"] = None
+        await broadcast(room_id, {"type":"system","text":"No accusations were made."})
+        await broadcast(room_id, {"type":"accused_update","accused": None})
+        return
+    tally = {}
+    for v in votes.values():
+        tally[v] = tally.get(v, 0) + 1
+    if not tally:
+        room["accused"] = None
+        await broadcast(room_id, {"type":"accused_update","accused": None})
+        return
+    top = max(tally, key=lambda k: tally[k])
+    counts = sorted(tally.values(), reverse=True)
+    if len(counts) > 1 and counts[0] == counts[1]:
+        room["accused"] = None
+        await broadcast(room_id, {"type":"system","text":"Tie in accusations — no one accused."})
+        await broadcast(room_id, {"type":"accused_update","accused": None})
+        return
+    room["accused"] = top
+    room.setdefault("accusation_history", []).append((room["day"], top))
+    await broadcast(room_id, {"type":"system","text": f"{top} has been accused and will defend themselves."})
+    await broadcast(room_id, {"type":"accused_update","accused": top})
+
+# ---------------- VERDICT RESOLUTION ----------------
+async def resolve_verdict(room_id: str):
+    room = rooms.get(room_id)
+    if not room: return
+    accused = room.get("accused")
+    if not accused:
+        await broadcast(room_id, {"type":"system","text":"No accused to judge."})
+        return
+    votes = room.get("verdict_votes", {}) or {}
+    if not votes:
+        await broadcast(room_id, {"type":"system","text":"No verdict votes — no lynch."})
+        room["accused"] = None
+        await broadcast(room_id, {"type":"accused_update","accused": None})
+        return
+    tally = {"guilty":0, "innocent":0}
+    for v in votes.values():
+        tally[v] = tally.get(v,0) + 1
+    if tally["guilty"] > tally["innocent"]:
+        victim = next((p for p in room["players"] if p["name"]==accused and p["alive"]), None)
+        if victim:
+            victim["alive"] = False
+            if accused not in room.get("cleaned_bodies", set()):
+                victim["revealed"] = True
+                await broadcast(room_id, {"type":"system","text": f"⚖️ {accused} was found GUILTY — {victim['role']} ({victim['faction']})"})
+            else:
+                await broadcast(room_id, {"type":"system","text": f"⚠️ {accused} was found guilty but corpse cleaned; role hidden."})
+            room["accused"] = None
+            room["verdict_votes"] = {}
+            await broadcast(room_id, {"type":"room","room": room_summary(room)})
+            await check_victory(room_id)
+            return
+    else:
+        await broadcast(room_id, {"type":"system","text": f"{accused} was found INNOCENT (tie or more innocent votes)."})
+    room["accused"] = None
+    room["verdict_votes"] = {}
+    await broadcast(room_id, {"type":"room","room": room_summary(room)})
+
+# ---------------- VOTES / DAY HELPERS ----------------
 async def resolve_votes_if_ready(room_id: str):
     room = rooms.get(room_id)
     if not room: return
@@ -725,7 +701,7 @@ async def resolve_votes_if_ready(room_id: str):
     await broadcast(room_id, {"type":"system","text": f"{top} has been accused."})
     await broadcast(room_id, {"type":"accused_update","accused": top})
 
-# ---------------- VICTORY & ENDGAME ----------------
+# ---------------- VICTORY ----------------
 async def check_victory(room_id: str):
     room = rooms.get(room_id)
     if not room: return
@@ -752,11 +728,12 @@ async def end_game(room_id: str, winner_faction: str):
     await broadcast(room_id, {"type":"system","text": "📜 Final Roles:\n" + recap})
     await broadcast(room_id, {"type":"room","room": room_summary(room)})
 
-# ---------------- STARTUP ----------------
+# ---------------- UTILS / STARTUP ----------------
 @app.on_event("startup")
 async def startup_event():
+    # create a sample room so there's at least one on first boot
     if not rooms:
         r = create_room_obj("Host")
         print("Created sample room:", r["id"])
 
-# End of main.py
+# ---------------- END OF FILE ----------------
