@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Town of Shadows")
 
-FRONTEND_URL = "https://690a8382d00a2311478c4251--celebrated-bonbon-1fd3cf.netlify.app"
+FRONTEND_URL = "https://effortless-cobbler-2ab85b.netlify.app"
 BACKEND_BASE = "https://town-of-shadows-server.onrender.com"
 
 app.add_middleware(
