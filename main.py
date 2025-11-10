@@ -1,6 +1,7 @@
 
-# main.py - Town of Shadows (tos_file - final)
-# Run: uvicorn main:app --host 0.0.0.0 --port $PORT
+# main.py - Town of Shadows (uselesschatgpt build)
+# Note: Accepts websocket connections at /ws, /ws/, /ws/{room_id}, /ws/{room_id}/
+# Run with: uvicorn main:app --host 0.0.0.0 --port $PORT
 
 import asyncio, json, random, time
 from typing import Dict, Any
@@ -108,13 +109,6 @@ async def join_room_endpoint(req: JoinReq):
     slot["name"]=req.name or slot["name"]
     return {"slot":slot["slot"], "role":slot["role"], "faction":slot["faction"], "room": room_summary(room)}
 
-@app.post("/start-game/{room_id}")
-async def start_game_http(room_id: str, req: Request):
-    if room_id not in rooms:
-        raise HTTPException(status_code=404, detail="Room not found")
-    await start_game(room_id)
-    return {"ok": True}
-
 # WebSocket helpers
 async def send_to_ws(room_id, wsid, message):
     mgr = ws_managers.get(room_id, {})
@@ -170,9 +164,13 @@ async def send_faction_mates(room_id):
             mates = faction_list(room,p)
             await send_to_player(room_id,p["name"],{"type":"faction_mates","mates":mates})
 
+# WebSocket endpoints
+# Support multiple route shapes to be robust against trailing slash or missing room in URL.
 @app.websocket("/ws/{room_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str):
+@app.websocket("/ws/{room_id}/")
+async def websocket_with_room(websocket: WebSocket, room_id: str):
     await websocket.accept()
+    await websocket.send_text(json.dumps({"type":"system","text":"Connected to ws with room path","room":room_id}))
     if room_id not in rooms:
         await websocket.send_text(json.dumps({"type":"system","text":"Room not found"}))
         await websocket.close()
@@ -180,7 +178,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     wsid=str(uuid4())
     ws_managers[room_id][wsid]=websocket
     try:
-        await websocket.send_text(json.dumps({"type":"system","text":f"Connected to {room_id}","ws_id":wsid}))
+        # keep receiving messages
         while True:
             raw = await websocket.receive_text()
             try:
@@ -193,6 +191,50 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         ws_managers[room_id].pop(wsid, None)
     except Exception:
         ws_managers[room_id].pop(wsid, None)
+
+# Accept connections on /ws and /ws/ (client may connect without room in path)
+@app.websocket("/ws")
+@app.websocket("/ws/")
+async def websocket_no_room(websocket: WebSocket):
+    await websocket.accept()
+    wsid=str(uuid4())
+    # temporary holding until client sends {"type":"connect_to","room":"ROOMID"}
+    try:
+        await websocket.send_text(json.dumps({"type":"system","text":"Connected to generic ws, send connect_to with room id"}))
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except:
+                await websocket.send_text(json.dumps({"type":"system","text":"Invalid JSON"}))
+                continue
+            if msg.get("type")=="connect_to" and msg.get("room"):
+                room_id = msg.get("room")
+                if room_id not in rooms:
+                    await websocket.send_text(json.dumps({"type":"system","text":"Room not found"}))
+                    await websocket.close()
+                    return
+                # register this ws under the room
+                ws_managers.setdefault(room_id,{})[wsid]=websocket
+                await websocket.send_text(json.dumps({"type":"system","text":"Connected to room via generic ws","room":room_id}))
+                # now hand off message processing to regular handler
+                while True:
+                    raw = await websocket.receive_text()
+                    try:
+                        msg = json.loads(raw)
+                    except:
+                        await websocket.send_text(json.dumps({"type":"system","text":"Invalid JSON"}))
+                        continue
+                    await handle_ws(room_id, wsid, msg)
+            else:
+                await websocket.send_text(json.dumps({"type":"system","text":"Send connect_to to join a room"}))
+    except WebSocketDisconnect:
+        # remove from any rooms it was assigned to
+        for rid, mgr in ws_managers.items():
+            if wsid in mgr: mgr.pop(wsid, None)
+    except Exception:
+        for rid, mgr in ws_managers.items():
+            if wsid in mgr: mgr.pop(wsid, None)
 
 async def handle_ws(room_id, wsid, msg):
     mtype = msg.get("type")
@@ -211,6 +253,19 @@ async def handle_ws(room_id, wsid, msg):
             await send_to_ws(room_id, wsid, {"type":"system","text":"Slot not found"})
         return
 
+    if mtype=="connect_to":
+        # support identify via connect_to in case client used generic /ws
+        slot = msg.get("slot")
+        if slot:
+            p = next((x for x in room["players"] if x["slot"]==slot), None)
+            if p:
+                p["ws_id"]=wsid
+                p["is_bot"]=False
+                await send_to_player(room_id,p["name"],{"type":"private_role","slot":p["slot"],"role":p["role"],"faction":p["faction"]})
+                await broadcast(room_id,{"type":"room","room":room_summary(room)})
+        return
+
+    # other message types (chat, player_action, vote etc.) — reuse earlier logic
     if mtype=="chat":
         ch = msg.get("channel","public")
         text = msg.get("text","")
@@ -364,7 +419,7 @@ async def phase_controller(room_id):
             await broadcast(room_id, {"type":"system","text":f"Phase controller error: {str(e)}"})
             await asyncio.sleep(2)
 
-# For brevity, include simple bot functions similar to previous builds
+# simplified bots and action resolution for stability (keeps prior behavior)
 async def simulate_bot_day_chat(room_id):
     room = rooms.get(room_id)
     if not room: return
@@ -455,10 +510,9 @@ async def simulate_bot_night_actions(room_id):
             await send_to_player(room_id, d["name"], {"type":"system","text":f"You healed {tgt} tonight."})
 
 async def apply_player_actions(room_id):
-    # simplified safe resolution to keep server stable for deployment/testing
+    # simplified placeholder resolution for stability
     room = rooms.get(room_id)
     if not room: return
-    # clear actions and mafia choices for now (detailed logic is in previous versions)
     room["actions"] = []
     room["mafia_night_actions"] = {}
     await broadcast(room_id, {"type":"room","room":room_summary(room)})
