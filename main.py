@@ -17,7 +17,10 @@ app = FastAPI(title="Town of Shadows")
 # Allow origins (set your frontend origin in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+    "https://narutowjouanki669-hash.github.io",
+    "https://narutowjouanki669-hash.github.io/game-trial",
+],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
